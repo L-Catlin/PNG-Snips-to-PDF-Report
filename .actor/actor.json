@@ -1,0 +1,1 @@
+{"actorSpecification":1,"name":"facebook-screenshot-pdf-merger","title":"Facebook Screenshot PDF Merger","description":"Merge Apify screenshot dataset PNGs into a paginated PDF","version":"0.1","input":"./input_schema.json","dockerfile":"../Dockerfile"}

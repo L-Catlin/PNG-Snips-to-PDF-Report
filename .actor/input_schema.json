@@ -1,0 +1,13 @@
+{
+  "title": "Facebook Screenshot PDF Merger",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "datasetId": {"title": "Screenshot dataset ID", "type": "string", "description": "Default dataset ID from hpbt/website-screenshot-pdf", "editor": "textfield"},
+    "pageSize": {"title": "PDF paper size", "type": "string", "description": "Standard paper size", "editor": "select", "enum": ["LETTER", "A4"], "default": "LETTER"},
+    "marginPoints": {"title": "Page margin (points)", "type": "integer", "description": "30 points is about 0.42 inches", "default": 30, "minimum": 0, "maximum": 150},
+    "gapPoints": {"title": "Space between posts (points)", "type": "integer", "description": "Vertical spacing between screenshots in PDF points.", "default": 12, "minimum": 0, "maximum": 100},
+    "trimWhiteEdges": {"title": "Trim white outer borders", "type": "boolean", "description": "Optional. Leave off to preserve full screenshot context.", "default": false}
+  },
+  "required": ["datasetId"]
+}

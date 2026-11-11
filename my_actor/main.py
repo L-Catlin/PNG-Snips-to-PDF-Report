@@ -1,382 +1,161 @@
 import asyncio
 import io
 import logging
-from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 
 import httpx
+from PIL import Image, ImageChops
 from apify import Actor
-from PIL import Image, ImageChops, ImageStat
-from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4, letter
-from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen.canvas import Canvas
 
 log = logging.getLogger(__name__)
 
 
-def image_is_blank(im):
-    sample = im.convert('RGB')
-    sample.thumbnail((256, 256))
-    stat = ImageStat.Stat(sample)
-    return (
-        all(mean > 250 for mean in stat.mean)
-        and max(stat.stddev) < 5
-    )
-
-
-def trim_white_edges(im, threshold=248, padding=8):
-    # Optional: trim near-white outer borders.
-    # Default OFF to preserve original screenshots.
-    rgb = im.convert('RGB')
-    background = Image.new('RGB', rgb.size, (255, 255, 255))
-
-    diff = ImageChops.difference(
-        rgb, background
-    ).convert('L').point(
-        lambda x: 255 if x > 255 - threshold else 0
-    )
-
-    bounds = diff.getbbox()
-
-    if not bounds:
-        return im
-
-    x0, y0, x1, y1 = bounds
-
-    return im.crop((
-        max(0, x0 - padding),
-        max(0, y0 - padding),
-        min(im.width, x1 + padding),
-        min(im.height, y1 + padding)
-    ))
-
-
-def extract_url(item):
-    for key in (
-        'fileUrl',
-        'fileURL',
-        'screenshotUrl',
-        'imageUrl',
-        'downloadUrl'
-    ):
-        value = item.get(key)
-
-        if isinstance(value, str) and value.startswith(
-            ('https://', 'http://')
-        ):
+def get_value(row, keys):
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, str) and value.startswith(('https://', 'http://')):
             return value
-
+        if isinstance(value, dict):
+            for nested in ('url', 'uri', 'href'):
+                v = value.get(nested)
+                if isinstance(v, str) and v.startswith(('https://', 'http://')):
+                    return v
     return None
 
 
-def add_screenshot_page(
-    pdf,
-    im,
-    page_width,
-    page_height,
-    margin=30
-):
-    """
-    Add exactly one screenshot to one PDF page.
+def canonical_source(url):
+    if not url:
+        return None
+    p = urlparse(url)
+    if '/photo' in p.path:
+        photo_id = parse_qs(p.query).get('fbid', [None])[0]
+        return f'photo:{photo_id}' if photo_id else url
+    if '/posts/' in p.path:
+        return 'post:' + p.path.rstrip('/').lower()
+    return url.rstrip('/')
 
-    - Preserves image aspect ratio.
-    - Fits within printable page boundaries.
-    - Centers horizontally.
-    - Aligns image to top.
-    - Leaves unused space blank.
-    - Never splits screenshots.
-    """
 
-    im = im.convert('RGB')
+async def read_all(dataset_id):
+    ds = Actor.apify_client.dataset(dataset_id)
+    output, offset = [], 0
+    while True:
+        result = await ds.list_items(offset=offset, limit=1000, clean=False)
+        batch = result.items or []
+        output.extend(batch)
+        offset += len(batch)
+        if len(batch) < 1000:
+            return output
 
-    available_width = page_width - (2 * margin)
-    available_height = page_height - (2 * margin)
 
-    # Scale screenshot to fit entirely on one page.
-    scale = min(
-        available_width / im.width,
-        available_height / im.height
-    )
+async def download_image(client, url):
+    response = await client.get(url, follow_redirects=True)
+    response.raise_for_status()
+    with Image.open(io.BytesIO(response.content)) as im:
+        im.load()
+        return im.convert('RGB')
 
-    draw_width = im.width * scale
-    draw_height = im.height * scale
 
-    # Center horizontally.
-    x = (page_width - draw_width) / 2
+def prepare_image(image, trim, max_height):
+    if trim:
+        # Trim only white borders, not colored Facebook UI or image content.
+        diff = ImageChops.difference(image, Image.new('RGB', image.size, 'white'))
+        bbox = diff.getbbox()
+        if bbox:
+            image = image.crop(bbox)
+    if max_height and image.height > max_height:
+        new_width = max(1, round(image.width * max_height / image.height))
+        image = image.resize((new_width, max_height), Image.Resampling.LANCZOS)
+    return image
 
-    # Align to top margin.
-    y = page_height - margin - draw_height
 
-    pdf.drawImage(
-        ImageReader(im),
-        x,
-        y,
-        width=draw_width,
-        height=draw_height
-    )
-
-    # Finish this page.
+def draw_page(pdf, image, page_size, margin):
+    page_w, page_h = page_size
+    image_w, image_h = image.size
+    scale = min((page_w - 2 * margin) / image_w, (page_h - 2 * margin) / image_h)
+    if scale <= 0:
+        raise ValueError('PDF margins leave no room for image')
+    w, h = image_w * scale, image_h * scale
+    x, y = (page_w - w) / 2, (page_h - h) / 2
+    from reportlab.lib.utils import ImageReader
+    pdf.drawImage(ImageReader(image), x, y, width=w, height=h)
     pdf.showPage()
 
 
 async def main():
-    print("PDF MERGER: main() started", flush=True)
-
     async with Actor:
         config = await Actor.get_input() or {}
-
-        dataset_id = (
-            config.get('datasetId') or ''
-        ).strip()
-
+        dataset_id = config.get('datasetId')
+        manifest = config.get('manifest')
         if not dataset_id:
-            raise ValueError(
-                'datasetId is required. Enter the '
-                'dataset ID of your screenshot Actor run.'
-            )
-
-        page_size_name = (
-            config.get('pageSize') or 'LETTER'
-        ).upper()
-
-        if page_size_name not in ('LETTER', 'A4'):
-            raise ValueError(
-                'pageSize must be LETTER or A4'
-            )
-
-        page_width, page_height = (
-            letter if page_size_name == 'LETTER'
-            else A4
-        )
-
-        margin = float(
-            config.get('marginPoints', 30)
-        )
-
-        trim = bool(
-            config.get('trimWhiteEdges', False)
-        )
-
-        # 0 means no height cropping.
-        max_image_height = int(
-            config.get('maxImageHeight', 0)
-        )
-
-        if (
-            margin < 0
-            or margin * 2 >= min(
-                page_width, page_height
-            )
-        ):
-            raise ValueError(
-                'Invalid marginPoints'
-            )
-
-        if max_image_height < 0:
-            raise ValueError(
-                'maxImageHeight must be 0 or greater'
-            )
-
-        pages = 0
-        placed = 0
-        skipped = []
-
+            raise ValueError('datasetId is required')
+        if not isinstance(manifest, list) or not manifest:
+            raise ValueError('manifest must be a nonempty ordered array')
+        size = str(config.get('pageSize') or 'LETTER').upper()
+        if size not in ('LETTER', 'A4'):
+            raise ValueError('pageSize must be LETTER or A4')
+        margin = float(config.get('marginPoints', 30))
+        max_height = int(config.get('maxImageHeight', 1400))
+        trim = bool(config.get('trimWhiteEdges', False))
+        if margin < 0 or max_height < 0:
+            raise ValueError('Invalid margins or maxImageHeight')
+        rows = await read_all(dataset_id)
+        # Map by source URL, never by screenshot dataset row position.
+        screenshots = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get('status') not in (None, 'success', 'SUCCEEDED'):
+                continue
+            source = get_value(row, ('inputUrl', 'input_url', 'sourceUrl', 'originalUrl', 'url', 'websiteUrl'))
+            image = get_value(row, ('screenshotUrl', 'screenshot_url', 'imageUrl', 'image_url', 'screenshot', 'image', 'fileUrl', 'outputUrl'))
+            if source and image:
+                screenshots.setdefault(canonical_source(source), image)
+        if not screenshots:
+            raise RuntimeError('No post screenshot URL mappings found in dataset.')
         output = io.BytesIO()
-
-        pdf = canvas.Canvas(
-            output,
-            pagesize=(page_width, page_height),
-            pageCompression=1
-        )
-
-        pdf.setTitle(
-            'Facebook post screenshots'
-        )
-
-        # Connect to screenshot dataset.
-        dataset = Actor.apify_client.dataset(
-            dataset_id
-        )
-
-        records = []
-        offset = 0
-
-        while True:
-            result = await dataset.list_items(
-                offset=offset,
-                limit=1000,
-                clean=False
-            )
-
-            batch = result.items
-            records.extend(batch)
-            offset += len(batch)
-
-            if not batch or len(batch) < 1000:
-                break
-
-        log.info(
-            'Found %s dataset records',
-            len(records)
-        )
-
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                60, connect=20
-            ),
-            follow_redirects=True
-        ) as client:
-
-            for index, item in enumerate(
-                records, 1
-            ):
-
-                url = (
-                    extract_url(item)
-                    if isinstance(item, dict)
-                    else None
-                )
-
-                if not url:
-                    skipped.append({
-                        'index': index,
-                        'reason': (
-                            'No supported image URL field'
-                        )
-                    })
+        pdf = Canvas(output, pagesize=letter if size == 'LETTER' else A4, pageCompression=1)
+        pages = 0
+        missing = []
+        async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
+            for entry in manifest:
+                if not isinstance(entry, dict) or not entry.get('url'):
                     continue
-
-                try:
-                    response = await client.get(url)
-                    response.raise_for_status()
-
-                    if len(response.content) > (
-                        35 * 1024 * 1024
-                    ):
-                        raise ValueError(
-                            'Image exceeds 35 MB limit'
-                        )
-
-                    with Image.open(
-                        io.BytesIO(response.content)
-                    ) as opened:
-                        opened.load()
-                        im = opened.convert('RGB')
-
-                    # Skip blank screenshots.
-                    if image_is_blank(im):
-                        skipped.append({
-                            'index': index,
-                            'reason': (
-                                'Nearly all-white screenshot'
-                            ),
-                            'url': url
-                        })
+                kind = entry.get('kind')
+                if kind == 'photo':
+                    # The photo is downloaded directly from the Photos Scraper's
+                    # image field; there is no screenshot for this manifest entry.
+                    image_url = entry.get('imageUrl')
+                    if not image_url:
+                        missing.append({'kind': kind, 'url': entry['url'], 'error': 'Direct image URL missing'})
                         continue
-
-                    # Optional whitespace trimming.
-                    if trim:
-                        im = trim_white_edges(im)
-
-                    # Optional maximum image height.
-                    # Crops from the bottom.
-                    if (
-                        max_image_height > 0
-                        and im.height > max_image_height
-                    ):
-                        im = im.crop((
-                            0,
-                            0,
-                            im.width,
-                            max_image_height
-                        ))
-
-                    # One screenshot = one PDF page.
-                    add_screenshot_page(
-                        pdf=pdf,
-                        im=im,
-                        page_width=page_width,
-                        page_height=page_height,
-                        margin=margin
-                    )
-
-                    placed += 1
+                elif kind == 'post':
+                    key = canonical_source(entry['url'])
+                    image_url = screenshots.get(key)
+                    if not image_url:
+                        missing.append({'kind': kind, 'url': entry['url'], 'error': 'Post screenshot missing'})
+                        continue
+                else:
+                    missing.append({'kind': kind, 'url': entry['url'], 'error': 'Unknown manifest kind'})
+                    continue
+                try:
+                    image = await download_image(client, image_url)
+                    image = prepare_image(image, trim, max_height)
+                    draw_page(pdf, image, letter if size == 'LETTER' else A4, margin)
                     pages += 1
-
-                    log.info(
-                        'Placed screenshot %s/%s '
-                        'on PDF page %s',
-                        index,
-                        len(records),
-                        pages
-                    )
-
                 except Exception as exc:
-                    log.warning(
-                        'Skipping record %s: %s',
-                        index,
-                        exc
-                    )
-
-                    skipped.append({
-                        'index': index,
-                        'reason': str(exc),
-                        'url': url
-                    })
-
-        if placed == 0:
-            raise ValueError(
-                'No usable screenshots found. '
-                f'First errors: {skipped[:5]}'
-            )
-
-        # Finalize PDF.
+                    log.warning('Could not include %s: %s', entry['url'], exc)
+                    missing.append({'kind': entry.get('kind'), 'url': entry['url'], 'error': str(exc)})
+        if pages == 0:
+            raise RuntimeError('No usable screenshots; no PDF generated')
         pdf.save()
-        output.seek(0)
-
-        await Actor.set_value(
-            'facebook-posts.pdf',
-            output.read(),
-            content_type='application/pdf'
-        )
-
-        summary = {
-            'datasetId': dataset_id,
-            'records': len(records),
-            'screenshotsIncluded': placed,
-            'screenshotsSkipped': len(skipped),
-            'pdfPages': pages,
-            'pageSize': page_size_name,
-            'maxImageHeight': max_image_height,
-            'skipped': skipped,
-            'generatedAt': (
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            )
-        }
-
-        await Actor.set_value(
-            'SUMMARY',
-            summary
-        )
-
-        await Actor.push_data({
-            'status': 'success',
-            'pdfKey': 'facebook-posts.pdf',
-            'summary': summary
-        })
-
-        log.info(
-            'Saved facebook-posts.pdf: '
-            '%s screenshots, %s pages',
-            placed,
-            pages
-        )
+        await Actor.set_value('facebook-posts.pdf', output.getvalue(), content_type='application/pdf')
+        summary = {'pages': pages, 'requestedPages': len(manifest), 'skipped': missing, 'pdfKey': 'facebook-posts.pdf'}
+        await Actor.set_value('SUMMARY', summary)
+        await Actor.push_data(summary)
+        log.info('Generated %s pages; skipped %s', pages, len(missing))
 
 
 if __name__ == '__main__':
-    print(
-        "PDF MERGER: Python entry point reached",
-        flush=True
-    )
     asyncio.run(main())

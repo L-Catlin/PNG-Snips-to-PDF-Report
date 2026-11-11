@@ -3,11 +3,80 @@
   "type": "object",
   "schemaVersion": 1,
   "properties": {
-    "datasetId": {"title": "Screenshot dataset ID", "type": "string", "description": "Default dataset ID from hpbt/website-screenshot-pdf", "editor": "textfield"},
-    "pageSize": {"title": "PDF paper size", "type": "string", "description": "Standard paper size", "editor": "select", "enum": ["LETTER", "A4"], "default": "LETTER"},
-    "marginPoints": {"title": "Page margin (points)", "type": "integer", "description": "30 points is about 0.42 inches", "default": 30, "minimum": 0, "maximum": 150},
-    "gapPoints": {"title": "Space between posts (points)", "type": "integer", "description": "Vertical spacing between screenshots in PDF points.", "default": 12, "minimum": 0, "maximum": 100},
-    "trimWhiteEdges": {"title": "Trim white outer borders", "type": "boolean", "description": "Optional. Leave off to preserve full screenshot context.", "default": false}
+    "datasetId": {
+      "title": "Screenshot dataset ID",
+      "type": "string",
+      "description": "Dataset ID produced by the screenshot Actor.",
+      "editor": "textfield"
+    },
+    "manifest": {
+      "title": "Ordered report manifest",
+      "type": "array",
+      "description": "Ordered post screenshot and additional direct-photo entries.",
+      "editor": "json",
+      "items": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "title": "Entry type",
+            "description": "post uses the screenshot dataset; photo uses imageUrl directly."
+          },
+          "url": {
+            "type": "string",
+            "title": "Source URL",
+            "description": "Facebook page URL used for the screenshot."
+          },
+          "postNumber": {
+            "type": "integer",
+            "title": "Post number",
+            "description": "Position of the parent post in the report."
+          },
+          "photoId": {
+            "type": "string",
+            "title": "Photo ID",
+            "description": "Facebook photo identifier, when this entry is a photo."
+          },
+          "imageUrl": {
+            "type": "string",
+            "title": "Direct photo image URL",
+            "description": "Original image URL returned by the Photos Scraper; required for photo entries."
+          }
+        }
+      }
+    },
+    "pageSize": {
+      "title": "Page size",
+      "type": "string",
+      "description": "PDF page size.",
+      "editor": "select",
+      "enum": [
+        "LETTER",
+        "A4"
+      ],
+      "default": "LETTER"
+    },
+    "marginPoints": {
+      "title": "Margin points",
+      "type": "integer",
+      "description": "Margin around screenshots in PDF points.",
+      "default": 30
+    },
+    "trimWhiteEdges": {
+      "title": "Trim white edges",
+      "type": "boolean",
+      "description": "Remove white image borders before fitting on PDF page.",
+      "default": false
+    },
+    "maxImageHeight": {
+      "title": "Maximum image height",
+      "type": "integer",
+      "description": "Maximum raster height in pixels; 0 disables resizing.",
+      "default": 1400
+    }
   },
-  "required": ["datasetId"]
+  "required": [
+    "datasetId",
+    "manifest"
+  ]
 }

@@ -9,6 +9,13 @@ from apify import Actor
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
+from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
 
 log = logging.getLogger(__name__)
 
@@ -84,45 +91,107 @@ def wrap_url(url, width, font="Helvetica", size=10):
     return lines
 
 
-def draw_page(pdf, image, page_size, margin, source_url=None, kind=None, jpeg_quality=85):
+def encode_image(image, quality):
+    stream = io.BytesIO()
+    if quality:
+        image.save(stream, format='JPEG', quality=quality, optimize=True, subsampling=0)
+    else:
+        image.save(stream, format='PNG')
+    return stream.getvalue()
+
+
+def layout(image, page_size, margin, source_url):
     page_w, page_h = page_size
     available_w = page_w - 2 * margin
-    top = page_h - margin
-    lines = wrap_url(source_url, available_w) if source_url else []
-    header_height = len(lines) * 13 + 21 if lines else 0
-    image_top = top - header_height
-    image_w, image_h = image.size
-    scale = min(available_w / image_w, (image_top - margin) / image_h)
+    lines = wrap_url(source_url, available_w - 2) if source_url else []
+    # Shared geometry; reserve a small amount for Word's inline image baseline.
+    header = 26 + 13 * len(lines) if lines else 0
+    scale = min(available_w / image.width,
+                (page_h - 2 * margin - header - 4) / image.height)
     if scale <= 0:
-        raise ValueError('PDF margins or URL leave no room for image')
-    w, h = image_w * scale, image_h * scale
-    x = (page_w - w) / 2
-    y = image_top - h if lines else (page_h - h) / 2
+        raise ValueError('Margins or URL leave no room for image')
+    w, h = image.width * scale, image.height * scale
+    top = margin + header if lines else (page_h - h) / 2
+    return lines, w, h, top
+
+
+def draw_page(pdf, encoded, page_size, margin, source_url, kind, geometry):
+    from reportlab.lib.utils import ImageReader
+    page_w, page_h = page_size
+    lines, w, h, top = geometry
     if lines:
         pdf.setFont('Helvetica-Bold', 10)
         pdf.setFillColorRGB(0, 0, 0)
-        pdf.drawCentredString(page_w / 2, top - 10, 'Facebook Profile' if kind == 'profile' else 'Post Link')
+        pdf.drawCentredString(page_w / 2, page_h - margin - 10,
+                              'Facebook Profile' if kind == 'profile' else 'Post Link')
         pdf.setFont('Helvetica', 10)
         pdf.setFillColorRGB(0, 0, 0.65)
         for i, line in enumerate(lines):
-            baseline = top - 23 - i * 13
+            baseline = page_h - margin - 23 - i * 13
             line_width = stringWidth(line, 'Helvetica', 10)
             left = (page_w - line_width) / 2
             pdf.drawCentredString(page_w / 2, baseline, line)
-            pdf.linkURL(source_url, (left, baseline - 2,
-                        left + line_width, baseline + 10),
-                        relative=0, thickness=0)
-        pdf.setFillColorRGB(0, 0, 0)
-    from reportlab.lib.utils import ImageReader
-    if jpeg_quality:
-        encoded = io.BytesIO()
-        image.save(encoded, format="JPEG", quality=jpeg_quality, optimize=True, subsampling=0)
-        encoded.seek(0)
-        reader = ImageReader(encoded)
-    else:
-        reader = ImageReader(image)
-    pdf.drawImage(reader, x, y, width=w, height=h)
+            pdf.linkURL(source_url, (left, baseline - 2, left + line_width, baseline + 10), relative=0, thickness=0)
+    pdf.drawImage(ImageReader(io.BytesIO(encoded)), (page_w-w)/2, page_h-top-h, width=w, height=h)
     pdf.showPage()
+
+
+def new_word(page_size, margin):
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = map(Pt, page_size)
+    sec.top_margin = sec.bottom_margin = sec.left_margin = sec.right_margin = Pt(margin)
+    normal = doc.styles['Normal']
+    normal.font.name = 'Arial'
+    normal.font.size = Pt(10)
+    return doc
+
+
+def word_paragraph(doc, first, new_page=False):
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fmt = p.paragraph_format
+    fmt.space_before = fmt.space_after = Pt(0)
+    fmt.line_spacing = Pt(13)
+    fmt.keep_with_next = False
+    fmt.keep_together = True
+    fmt.widow_control = False
+    fmt.page_break_before = first and new_page
+    return p
+
+
+def add_link(p, text, url):
+    link = OxmlElement('w:hyperlink')
+    link.set(qn('r:id'), p.part.relate_to(url, RT.HYPERLINK, is_external=True))
+    run = OxmlElement('w:r')
+    props = OxmlElement('w:rPr')
+    for tag, val in [('color', '0000A6'), ('sz', '20')]:
+        node = OxmlElement('w:' + tag); node.set(qn('w:val'), val); props.append(node)
+    fonts = OxmlElement('w:rFonts'); fonts.set(qn('w:ascii'), 'Arial'); fonts.set(qn('w:hAnsi'), 'Arial'); props.append(fonts)
+    run.append(props)
+    t = OxmlElement('w:t'); t.text = text; run.append(t)
+    link.append(run); p._p.append(link)
+
+
+def draw_word_page(doc, encoded, page_size, margin, source_url, kind, geometry, new_page):
+    lines, w, h, top = geometry
+    if lines:
+        p = word_paragraph(doc, True, new_page)
+        r = p.add_run('Facebook Profile' if kind == 'profile' else 'Post Link')
+        r.bold = True
+        for line in lines:
+            p = word_paragraph(doc, False)
+            add_link(p, line, source_url)
+    p = word_paragraph(doc, not lines, new_page)
+    p.paragraph_format.space_before = Pt(13 if lines else max(0, top-margin))
+    # An exact-height line box can position an inline drawing above its
+    # paragraph in Word. Let the drawing establish the line height instead.
+    fmt = p.paragraph_format
+    fmt.line_spacing_rule = WD_LINE_SPACING.SINGLE
+    run = p.add_run()
+    # Minimize the extra descent/baseline space below the inline drawing.
+    run.font.size = Pt(1)
+    run.add_picture(io.BytesIO(encoded), width=Pt(w), height=Pt(h))
 
 
 async def main():
@@ -164,19 +233,25 @@ async def main():
             raise RuntimeError('No post screenshot URL mappings found in dataset.')
         output = io.BytesIO()
         pdf = Canvas(output, pagesize=letter if size == 'LETTER' else A4, pageCompression=1)
+        page_size = letter if size == 'LETTER' else A4
+        doc = new_word(page_size, margin)
         pages = 0
         missing = []
+        included = []
         async with httpx.AsyncClient(timeout=40, follow_redirects=True) as client:
             for entry in manifest:
                 if not isinstance(entry, dict) or not entry.get('url'):
                     continue
                 kind = entry.get('kind')
                 if kind == 'photo':
+                    if entry.get('downloadError'):
+                        missing.append({**entry, 'error': entry['downloadError']})
+                        continue
                     # The photo is downloaded directly from the Photos Scraper's
                     # image field; there is no screenshot for this manifest entry.
                     image_url = entry.get('imageUrl')
-                    if not image_url:
-                        missing.append({'kind': kind, 'url': entry['url'], 'error': 'Direct image URL missing'})
+                    if not image_url and not entry.get('storageKey'):
+                        missing.append({**entry, 'error': 'Direct image URL missing'})
                         continue
                 elif kind in ('profile', 'post'):
                     key = canonical_source(entry['url'])
@@ -190,22 +265,38 @@ async def main():
                     missing.append({'kind': kind, 'url': entry['url'], 'error': 'Unknown manifest kind'})
                     continue
                 try:
-                    image = await download_image(client, image_url)
+                    if kind == 'photo' and entry.get('storageKey'):
+                        record = await Actor.apify_client.key_value_store(entry['storageId']).get_record(entry['storageKey'])
+                        if not record:
+                            raise ValueError('Cached photo record missing')
+                        with Image.open(io.BytesIO(record.value if hasattr(record, 'value') else record['value'])) as im:
+                            im.load()
+                            image = im.convert('RGB')
+                    else:
+                        image = await download_image(client, image_url)
                     image = prepare_image(image, trim, max_height)
-                    draw_page(pdf, image, letter if size == 'LETTER' else A4, margin,
-                              source_url=entry['url'] if kind in ('profile', 'post') else None,
-                              kind=kind, jpeg_quality=jpeg_quality)
-                    pages += 1
+                    source_url = entry['url'] if kind in ('profile', 'post') else None
+                    encoded = encode_image(image, jpeg_quality)
+                    geometry = layout(image, page_size, margin, source_url)
                 except Exception as exc:
                     if kind == 'profile':
                         raise RuntimeError('Required profile screenshot could not be included') from exc
                     log.warning('Could not include %s: %s', entry['url'], exc)
-                    missing.append({'kind': entry.get('kind'), 'url': entry['url'], 'error': str(exc)})
+                    missing.append({**entry, 'error': str(exc)})
+                    continue
+                # Rendering failures are fatal to avoid mismatched documents.
+                draw_page(pdf, encoded, page_size, margin, source_url, kind, geometry)
+                draw_word_page(doc, encoded, page_size, margin, source_url, kind, geometry, pages > 0)
+                pages += 1
+                included.append({"kind": kind, "url": entry["url"], "photoId": entry.get("photoId"), "page": pages})
         if pages == 0:
             raise RuntimeError('No usable screenshots; no PDF generated')
         pdf.save()
         await Actor.set_value('facebook-posts.pdf', output.getvalue(), content_type='application/pdf')
-        summary = {'pages': pages, 'requestedPages': len(manifest), 'skipped': missing, 'pdfKey': 'facebook-posts.pdf', 'jpegQuality': jpeg_quality, 'pdfBytes': len(output.getvalue())}
+        word_output = io.BytesIO()
+        doc.save(word_output)
+        await Actor.set_value('facebook-posts.docx', word_output.getvalue(), content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+        summary = {'docxKey': 'facebook-posts.docx', 'docxBytes': len(word_output.getvalue()), 'pages': pages, 'requestedPages': len(manifest), 'skipped': missing, 'included': included, 'pdfKey': 'facebook-posts.pdf', 'jpegQuality': jpeg_quality, 'pdfBytes': len(output.getvalue())}
         await Actor.set_value('SUMMARY', summary)
         await Actor.push_data(summary)
         log.info('Generated %s pages; skipped %s', pages, len(missing))

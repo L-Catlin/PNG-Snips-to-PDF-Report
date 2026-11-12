@@ -8,6 +8,7 @@ from PIL import Image, ImageChops
 from apify import Actor
 from reportlab.lib.pagesizes import A4, letter
 from reportlab.pdfgen.canvas import Canvas
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 log = logging.getLogger(__name__)
 
@@ -70,16 +71,57 @@ def prepare_image(image, trim, max_height):
     return image
 
 
-def draw_page(pdf, image, page_size, margin):
+def wrap_url(url, width, font="Helvetica", size=10):
+    """Wrap even unbroken Facebook IDs without dropping characters."""
+    lines, line = [], ""
+    for char in url:
+        if line and stringWidth(line + char, font, size) > width:
+            lines.append(line)
+            line = ""
+        line += char
+    if line:
+        lines.append(line)
+    return lines
+
+
+def draw_page(pdf, image, page_size, margin, source_url=None, kind=None, jpeg_quality=85):
     page_w, page_h = page_size
+    available_w = page_w - 2 * margin
+    top = page_h - margin
+    lines = wrap_url(source_url, available_w) if source_url else []
+    header_height = len(lines) * 13 + 21 if lines else 0
+    image_top = top - header_height
     image_w, image_h = image.size
-    scale = min((page_w - 2 * margin) / image_w, (page_h - 2 * margin) / image_h)
+    scale = min(available_w / image_w, (image_top - margin) / image_h)
     if scale <= 0:
-        raise ValueError('PDF margins leave no room for image')
+        raise ValueError('PDF margins or URL leave no room for image')
     w, h = image_w * scale, image_h * scale
-    x, y = (page_w - w) / 2, (page_h - h) / 2
+    x = (page_w - w) / 2
+    y = image_top - h if lines else (page_h - h) / 2
+    if lines:
+        pdf.setFont('Helvetica-Bold', 10)
+        pdf.setFillColorRGB(0, 0, 0)
+        pdf.drawCentredString(page_w / 2, top - 10, 'Facebook Profile' if kind == 'profile' else 'Post Link')
+        pdf.setFont('Helvetica', 10)
+        pdf.setFillColorRGB(0, 0, 0.65)
+        for i, line in enumerate(lines):
+            baseline = top - 23 - i * 13
+            line_width = stringWidth(line, 'Helvetica', 10)
+            left = (page_w - line_width) / 2
+            pdf.drawCentredString(page_w / 2, baseline, line)
+            pdf.linkURL(source_url, (left, baseline - 2,
+                        left + line_width, baseline + 10),
+                        relative=0, thickness=0)
+        pdf.setFillColorRGB(0, 0, 0)
     from reportlab.lib.utils import ImageReader
-    pdf.drawImage(ImageReader(image), x, y, width=w, height=h)
+    if jpeg_quality:
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG", quality=jpeg_quality, optimize=True, subsampling=0)
+        encoded.seek(0)
+        reader = ImageReader(encoded)
+    else:
+        reader = ImageReader(image)
+    pdf.drawImage(reader, x, y, width=w, height=h)
     pdf.showPage()
 
 
@@ -98,9 +140,15 @@ async def main():
         margin = float(config.get('marginPoints', 30))
         max_height = int(config.get('maxImageHeight', 1400))
         trim = bool(config.get('trimWhiteEdges', False))
+        jpeg_quality = int(config.get('jpegQuality', 85))
+        if not 0 <= jpeg_quality <= 100:
+            raise ValueError('jpegQuality must be between 0 and 100 (0 disables JPEG compression)')
         if margin < 0 or max_height < 0:
             raise ValueError('Invalid margins or maxImageHeight')
         rows = await read_all(dataset_id)
+        profile_dataset_id = config.get("profileDatasetId")
+        if profile_dataset_id and profile_dataset_id != dataset_id:
+            rows.extend(await read_all(profile_dataset_id))
         # Map by source URL, never by screenshot dataset row position.
         screenshots = {}
         for row in rows:
@@ -130,10 +178,12 @@ async def main():
                     if not image_url:
                         missing.append({'kind': kind, 'url': entry['url'], 'error': 'Direct image URL missing'})
                         continue
-                elif kind == 'post':
+                elif kind in ('profile', 'post'):
                     key = canonical_source(entry['url'])
                     image_url = screenshots.get(key)
                     if not image_url:
+                        if kind == 'profile':
+                            raise RuntimeError('Required profile screenshot missing')
                         missing.append({'kind': kind, 'url': entry['url'], 'error': 'Post screenshot missing'})
                         continue
                 else:
@@ -142,16 +192,20 @@ async def main():
                 try:
                     image = await download_image(client, image_url)
                     image = prepare_image(image, trim, max_height)
-                    draw_page(pdf, image, letter if size == 'LETTER' else A4, margin)
+                    draw_page(pdf, image, letter if size == 'LETTER' else A4, margin,
+                              source_url=entry['url'] if kind in ('profile', 'post') else None,
+                              kind=kind, jpeg_quality=jpeg_quality)
                     pages += 1
                 except Exception as exc:
+                    if kind == 'profile':
+                        raise RuntimeError('Required profile screenshot could not be included') from exc
                     log.warning('Could not include %s: %s', entry['url'], exc)
                     missing.append({'kind': entry.get('kind'), 'url': entry['url'], 'error': str(exc)})
         if pages == 0:
             raise RuntimeError('No usable screenshots; no PDF generated')
         pdf.save()
         await Actor.set_value('facebook-posts.pdf', output.getvalue(), content_type='application/pdf')
-        summary = {'pages': pages, 'requestedPages': len(manifest), 'skipped': missing, 'pdfKey': 'facebook-posts.pdf'}
+        summary = {'pages': pages, 'requestedPages': len(manifest), 'skipped': missing, 'pdfKey': 'facebook-posts.pdf', 'jpegQuality': jpeg_quality, 'pdfBytes': len(output.getvalue())}
         await Actor.set_value('SUMMARY', summary)
         await Actor.push_data(summary)
         log.info('Generated %s pages; skipped %s', pages, len(missing))

@@ -41,6 +41,26 @@
             "type": "string",
             "title": "Direct photo image URL",
             "description": "Original image URL returned by the Photos Scraper; required for photo entries."
+          },
+          "photoUrl": {
+            "type": "string",
+            "title": "Photo viewer URL",
+            "description": "Photo viewer URL for an additional photo."
+          },
+          "storageKey": {
+            "type": "string",
+            "title": "Cached image record key",
+            "description": "Cached image record key for an additional photo."
+          },
+          "storageId": {
+            "type": "string",
+            "title": "Cached image store ID",
+            "description": "Cached image store ID for an additional photo."
+          },
+          "downloadError": {
+            "type": "string",
+            "title": "Photo download failure",
+            "description": "Photo download failure for an additional photo."
           }
         }
       }

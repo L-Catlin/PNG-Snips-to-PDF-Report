@@ -12,7 +12,7 @@
     "manifest": {
       "title": "Ordered report manifest",
       "type": "array",
-      "description": "Ordered post screenshot and additional direct-photo entries.",
+      "description": "Ordered profile screenshot, post screenshots and additional direct-photo entries.",
       "editor": "json",
       "items": {
         "type": "object",
@@ -20,7 +20,7 @@
           "kind": {
             "type": "string",
             "title": "Entry type",
-            "description": "post uses the screenshot dataset; photo uses imageUrl directly."
+            "description": "profile and post use screenshot datasets; photo uses imageUrl directly."
           },
           "url": {
             "type": "string",
@@ -73,6 +73,20 @@
       "type": "integer",
       "description": "Maximum raster height in pixels; 0 disables resizing.",
       "default": 1400
+    },
+    "profileDatasetId": {
+      "title": "Profile screenshot dataset ID",
+      "type": "string",
+      "description": "Optional separate dataset containing the unscrolled profile screenshot.",
+      "editor": "textfield"
+    },
+    "jpegQuality": {
+      "title": "JPEG image quality",
+      "type": "integer",
+      "description": "JPEG quality for embedded images, 1\u2013100. Default 85; 0 disables JPEG compression.",
+      "default": 85,
+      "minimum": 0,
+      "maximum": 100
     }
   },
   "required": [
